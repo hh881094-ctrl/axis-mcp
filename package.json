@@ -1,0 +1,37 @@
+{
+  "name": "axis-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Axis (team action management tool) — exposes goals, KPIs, tasks, and team data to Claude / Cursor / Claude Desktop.",
+  "type": "module",
+  "bin": {
+    "axis-mcp": "./dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "axis",
+    "supabase"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@supabase/supabase-js": "^2.104.1",
+    "dotenv": "^17.4.2",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}
