@@ -31,6 +31,7 @@ npm run build
 | `MCP_BEARER_TOKEN` | http時必須 | HTTP接続の認証トークン（各クライアントが `Authorization: Bearer` で送る） |
 | `MCP_PORT` | 任意 | HTTPポート（既定 8787） |
 | `MCP_READONLY` | 任意 | `1` で書き込み系ツールを無効化（閲覧専用にする） |
+| `AXIS_MEMBER_TOKENS` | メンバー運用時 | メンバー別トークンの JSON 配列（下記「メンバーにも使わせる」参照） |
 
 > このチームの既定値: `AXIS_DEFAULT_TEAM_ID=db544bee-cae2-4310-9510-7c8193a3aa3e`（マイチーム）/ `AXIS_DEFAULT_USER_ID=694aae26-94e3-4e3c-a6a3-461f17d0d388`（弘中颯人）
 
@@ -97,6 +98,25 @@ claude mcp add axis --transport http --url https://<your-host>/mcp \
 ```
 
 ---
+
+## メンバーにも使わせる（チーム展開）
+
+各メンバーが自分の Claude（claude.ai / Desktop / Code）を繋いで「自分のタスク・自分視点」で使える。
+
+**仕組み**: メンバーごとに個人トークンを発行 → サーバーが `Authorization: Bearer <token>` から「誰か」を判定し、その人視点でデータを返す（非owner は他人の private ゴールが見えない／今日のタスクは自分のぶんのみ＝Axis本体と同じ振る舞い）。
+
+1. **トークンを env に設定**（HTTPデプロイ時のサーバー env）:
+   ```
+   AXIS_MEMBER_TOKENS=[{"token":"axis_xxx","user_id":"<uuid>","name":"山本将来","is_owner":false}, ...]
+   ```
+   - `is_owner:true` のトークンは全体閲覧＋`list_teams`可。`false` は本人スコープ＋privacy制限。
+   - （このチームの全メンバー分は発行済み。配布用一覧は `goal-os/outputs/axis-mcp-tokens.md`。※秘密情報なのでGit管理しない）
+2. **各メンバーがコネクタ登録**: claude.ai → 設定 → コネクタ → カスタムコネクタ →
+   - URL: `https://<your-host>/mcp`
+   - 認証: 自分のトークンを Bearer に貼る
+3. これで「axisで今日の自分のタスク見せて」が各自のClaudeで動く。
+
+> トークンの無効化＝env から該当行を消して再デプロイ。`MCP_BEARER_TOKEN`（管理者トークン）は owner 全権として併用可。
 
 ## 利用可能なツール（18個）
 
