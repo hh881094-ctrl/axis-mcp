@@ -1,0 +1,25 @@
+# Render Blueprint — claude.ai(Web) から繋ぐための公開HTTPSエンドポイントを1クリックで立てる。
+# Render ダッシュボードで「New + → Blueprint」→ このリポジトリを選択。
+# 環境変数（sync:false のもの）はデプロイ時にダッシュボードで入力する。
+services:
+  - type: web
+    name: axis-mcp
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm ci && npm run build
+    startCommand: node dist/index.js
+    healthCheckPath: /health
+    envVars:
+      - key: MCP_TRANSPORT
+        value: http
+      - key: AXIS_DEFAULT_TEAM_ID
+        value: db544bee-cae2-4310-9510-7c8193a3aa3e
+      - key: AXIS_DEFAULT_USER_ID
+        value: 694aae26-94e3-4e3c-a6a3-461f17d0d388
+      - key: AXIS_SUPABASE_URL
+        value: https://trqpkkxugbqkvxsxmdfh.supabase.co
+      - key: AXIS_SUPABASE_SERVICE_ROLE_KEY
+        sync: false   # ← ダッシュボードで現行の service_role キーを入力
+      - key: MCP_BEARER_TOKEN
+        generateValue: true   # ← Render が強いトークンを自動生成。接続時にこの値を使う

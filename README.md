@@ -24,7 +24,7 @@ npm run build
 | Key | 必須 | 説明 |
 |-----|------|------|
 | `AXIS_SUPABASE_URL` | ✅ | Supabase プロジェクト URL（例: `https://trqpkkxugbqkvxsxmdfh.supabase.co`） |
-| `AXIS_SUPABASE_SERVICE_ROLE_KEY` | ✅ | Supabase service_role キー（Dashboard → Project Settings → API Keys）。**期限切れ/ローテーション済みなら更新する** |
+| `AXIS_SUPABASE_SERVICE_ROLE_KEY` | ✅ | Supabase service_role キー。**Axis本体(goal-os)と同一プロジェクト**(`trqpkkxugbqkvxsxmdfh`)なので、`goal-os/.env.local` の `SUPABASE_SERVICE_ROLE_KEY` の値をそのままコピーすればよい（ダッシュボード不要）。古いキーだと `Invalid API key` になる |
 | `AXIS_DEFAULT_TEAM_ID` | 任意 | 既定チームID。設定すると Claude が team_id を指定せずツールを呼べる |
 | `AXIS_DEFAULT_USER_ID` | 任意 | 既定ユーザーID（今日のタスクなどの主体） |
 | `MCP_TRANSPORT` | 任意 | `stdio`(既定) or `http` |
@@ -68,16 +68,26 @@ claude mcp add axis --command node --args /Users/hironakahayato/axis-mcp/dist/in
 
 ### 3) claude.ai（Web・リモートHTTP）※ Pro 以上が必要
 
-まず公開HTTPSにデプロイ（Railway / Render / Fly.io 等。`MCP_TRANSPORT=http` で起動）:
+まず公開HTTPSにデプロイする。リポジトリに **Render Blueprint(`render.yaml`) / Railway(`railway.json`) / `Dockerfile`** を同梱済みなので、ほぼワンクリック。
 
+**Render（推奨・無料枠）:**
+1. [render.com](https://render.com) → New + → **Blueprint** → このリポジトリを選択
+2. `render.yaml` が読まれる。デプロイ時に入力を求められる env:
+   - `AXIS_SUPABASE_SERVICE_ROLE_KEY` … goal-os と同じ service_role キー
+   - `MCP_BEARER_TOKEN` … Render が自動生成（控えておく）
+3. デプロイ完了 → `https://axis-mcp-xxxx.onrender.com` が公開URL。`/health` で疎通確認。
+
+**Railway:** New Project → Deploy from repo → `Dockerfile`/`railway.json` 自動検出 → Variables に `AXIS_SUPABASE_URL` / `AXIS_SUPABASE_SERVICE_ROLE_KEY` / `MCP_BEARER_TOKEN` / `MCP_TRANSPORT=http` / `AXIS_DEFAULT_TEAM_ID` / `AXIS_DEFAULT_USER_ID` を設定。
+
+**ローカルで試すだけ:**
 ```bash
 MCP_TRANSPORT=http MCP_BEARER_TOKEN=（長いランダム文字列） npm start
-# → https://<your-host>/mcp が公開エンドポイント
+# → http://localhost:8787/mcp
 ```
 
-claude.ai → 設定 → コネクタ → **カスタムコネクタを追加**:
+**claude.ai 側の接続:** 設定 → コネクタ → **カスタムコネクタを追加**:
 - URL: `https://<your-host>/mcp`
-- 認証: Bearer トークンに上の `MCP_BEARER_TOKEN` を貼る
+- 認証: Bearer トークンに `MCP_BEARER_TOKEN` の値を貼る
 
 同じHTTPSエンドポイントは Claude Code / Desktop からも使える:
 
