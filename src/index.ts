@@ -7,8 +7,14 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import express from "express";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import dotenv from "dotenv";
 
+// クライアント(Claude Code/Desktop)が任意の cwd から起動しても .env を読めるよう、
+// パッケージルート基準で読み込む。env が既に与えられている場合は上書きしない。
+const __dirname = dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: join(__dirname, "..", ".env") });
 dotenv.config();
 
 const supabaseUrl = process.env.AXIS_SUPABASE_URL!;
