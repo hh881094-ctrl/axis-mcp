@@ -103,6 +103,20 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
     return q.or(`is_private.is.null,is_private.eq.false,created_by.eq.${ctxUser}`);
   };
 
+  /**
+   * goal_id を受け取るツールの共通ゲート。
+   * ここを通さずに goals / comments / deliverables を goal_id で直接引かないこと
+   * （service_role 接続のため RLS は効かず、この関数だけが防壁）。
+   * 見えない場合は null を返す（存在の有無も伝えない）。
+   */
+  const readableGoal = async (goalId: string) => {
+    const { data, error } = await supabase.from("goals").select("*").eq("id", goalId).maybeSingle();
+    if (error || !data) return null;
+    if (ctxTeam && data.team_id !== ctxTeam) return null;                        // 別チームのゴールは引けない
+    if (!isOwner && data.is_private && data.created_by !== ctxUser) return null; // 他人の private は引けない
+    return data;
+  };
+
   // ── 発見系 ───────────────────────────────────────────────
   server.tool(
     "whoami",
@@ -203,11 +217,13 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
     "ゴールの詳細（KPI・サブゴール・成果物・コメント数）を取得する。",
     { goal_id: z.string() },
     async ({ goal_id }) => {
-      const { data: goal, error } = await supabase.from("goals").select("*").eq("id", goal_id).single();
-      if (error) return text(`Error: ${error.message}`);
-      if (!isOwner && goal.is_private && goal.created_by !== ctxUser) return text("このゴールは非公開のため閲覧できません");
+      const goal = await readableGoal(goal_id);
+      if (!goal) return text("このゴールは閲覧できません（非公開、または別チームのゴールです）");
       const { data: kpis } = await supabase.from("goal_progress").select("id, title, current_value, target_value, unit").eq("goal_id", goal_id);
-      const { data: subgoals } = await supabase.from("goals").select("id, title, status, assigned_to, due_date").eq("parent_id", goal_id).order("sort_order");
+      // サブゴールにも親と同じプライバシー規則を適用する（公開の親の下に private な子がぶら下がっていても漏らさない）
+      let sq = supabase.from("goals").select("id, title, status, assigned_to, due_date").eq("parent_id", goal_id).order("sort_order");
+      sq = applyGoalPrivacy(sq);
+      const { data: subgoals } = await sq;
       const { count: commentCount } = await supabase.from("comments").select("id", { count: "exact", head: true }).eq("goal_id", goal_id);
       const { data: deliverables } = await supabase.from("deliverables").select("id, title, type, file_url, link_url").eq("goal_id", goal_id);
       return json({ ...goal, kpis: kpis ?? [], subgoals: subgoals ?? [], comment_count: commentCount ?? 0, deliverables: deliverables ?? [] });
@@ -299,9 +315,14 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
       const result = [];
       for (const p of phases ?? []) {
         const { data: kpis } = await supabase.from("phase_kpis").select("id, title, current_value, target_value, unit").eq("phase_id", p.id);
-        const { count: ac } = await supabase.from("goals").select("id", { count: "exact", head: true }).eq("team_id", tid).eq("phase_id", p.id).eq("status", "active");
-        const { count: cc } = await supabase.from("goals").select("id", { count: "exact", head: true }).eq("team_id", tid).eq("phase_id", p.id).eq("status", "completed");
-        result.push({ ...p, kpis: kpis ?? [], active_goals: ac ?? 0, completed_goals: cc ?? 0 });
+        // 件数にも privacy を効かせる（見えないはずの private ゴールを数に含めない）
+        const countBy = async (status: "active" | "completed") => {
+          let cq = supabase.from("goals").select("id", { count: "exact", head: true }).eq("team_id", tid).eq("phase_id", p.id).eq("status", status);
+          cq = applyGoalPrivacy(cq);
+          const { count } = await cq;
+          return count ?? 0;
+        };
+        result.push({ ...p, kpis: kpis ?? [], active_goals: await countBy("active"), completed_goals: await countBy("completed") });
       }
       return json(result);
     }
@@ -338,6 +359,8 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
     "ゴールのコメントスレッドを取得する。",
     { goal_id: z.string() },
     async ({ goal_id }) => {
+      // コメントは親ゴールの公開範囲を継承する。private ゴールのスレッドを覗かせない。
+      if (!(await readableGoal(goal_id))) return text("このゴールは閲覧できません（非公開、または別チームのゴールです）");
       const { data, error } = await supabase.from("comments").select("id, user_id, content, created_at").eq("goal_id", goal_id).order("created_at");
       if (error) return text(`Error: ${error.message}`);
       return json(data);
@@ -378,6 +401,7 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
       "ゴールを完了にする（子孫も連動）。",
       { goal_id: z.string() },
       async ({ goal_id }) => {
+        if (!(await readableGoal(goal_id))) return text("このゴールは操作できません（非公開、または別チームのゴールです）");
         const { error } = await supabase.from("goals").update({ status: "completed", updated_at: new Date().toISOString() }).eq("id", goal_id);
         if (error) return text(`Error: ${error.message}`);
         await supabase.rpc("update_descendants_status", { p_parent_id: goal_id, p_status: "completed" });
@@ -390,6 +414,9 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
       "KPI(goal_progress)の現在値を更新する。",
       { kpi_id: z.string(), current_value: z.number() },
       async ({ kpi_id, current_value }) => {
+        // KPI 単体では権限が判定できないので、親ゴール経由でゲートを通す
+        const { data: kpi } = await supabase.from("goal_progress").select("goal_id").eq("id", kpi_id).maybeSingle();
+        if (!kpi || !(await readableGoal(kpi.goal_id))) return text("このKPIは操作できません（非公開、または別チームのゴールです）");
         const { error } = await supabase.from("goal_progress").update({ current_value, updated_at: new Date().toISOString() }).eq("id", kpi_id);
         if (error) return text(`Error: ${error.message}`);
         return text(`KPI ${kpi_id} を ${current_value} に更新しました`);
@@ -402,6 +429,7 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
       { goal_id: z.string(), content: z.string() },
       async ({ goal_id, content }) => {
         if (!ctxUser) return text("user_id が必要です");
+        if (!(await readableGoal(goal_id))) return text("このゴールは操作できません（非公開、または別チームのゴールです）");
         const { error } = await supabase.from("comments").insert({ goal_id, user_id: ctxUser, content });
         if (error) return text(`Error: ${error.message}`);
         return text("コメントを追加しました");

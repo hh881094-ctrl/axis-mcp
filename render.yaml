@@ -1,6 +1,19 @@
-# Render Blueprint — claude.ai(Web) から繋ぐための公開HTTPSエンドポイントを1クリックで立てる。
+# Render Blueprint — メンバーの Claude から Axis を「読み取り専用」で繋ぐための公開HTTPSエンドポイント。
 # Render ダッシュボードで「New + → Blueprint」→ このリポジトリを選択。
-# 環境変数（sync:false のもの）はデプロイ時にダッシュボードで入力する。
+# sync:false の環境変数はデプロイ時にダッシュボードで入力する。
+#
+# 【設計方針・触る前に読むこと】
+#   このサーバーは Supabase に service_role で繋いでいる = RLS が効かない。
+#   privateゴール(インセン・評価・個人タスク)を守っているのは src/index.ts の
+#   applyGoalPrivacy() と readableGoal() だけ。そこが唯一の防壁。
+#
+#   1. MCP_READONLY=1 は外さない。外すと書き込み5本が公開される。
+#   2. MCP_BEARER_TOKEN は意図的に設定していない。
+#      あれは is_owner=true の管理者トークンで AXIS_DEFAULT_USER_ID(=弘中)として
+#      振る舞うため、1本漏れるだけで全privateゴールが読まれ書き込みもされる。
+#      公開エンドポイントには置かない。同じ理由で AXIS_DEFAULT_USER_ID も置かない。
+#   3. メンバーは AXIS_MEMBER_TOKENS に is_owner:false で1人ずつ登録する。
+#      失効させたい時はこの環境変数から該当行を消して再デプロイする。
 services:
   - type: web
     name: axis-mcp
@@ -13,13 +26,24 @@ services:
     envVars:
       - key: MCP_TRANSPORT
         value: http
+
+      # 読み取り専用。add_today_task / complete_task / complete_goal /
+      # update_kpi_value / add_comment の5本がツール一覧から消える。
+      - key: MCP_READONLY
+        value: "1"
+
       - key: AXIS_DEFAULT_TEAM_ID
         value: db544bee-cae2-4310-9510-7c8193a3aa3e
-      - key: AXIS_DEFAULT_USER_ID
-        value: 694aae26-94e3-4e3c-a6a3-461f17d0d388
+
       - key: AXIS_SUPABASE_URL
         value: https://trqpkkxugbqkvxsxmdfh.supabase.co
+
+      # Supabase の service_role キー。ダッシュボードで入力する。
       - key: AXIS_SUPABASE_SERVICE_ROLE_KEY
-        sync: false   # ← ダッシュボードで現行の service_role キーを入力
-      - key: MCP_BEARER_TOKEN
-        generateValue: true   # ← Render が強いトークンを自動生成。接続時にこの値を使う
+        sync: false
+
+      # メンバー個人トークン。ダッシュボードで JSON 配列を入力する。
+      # 例: [{"token":"axis_...","user_id":"<uuid>","name":"井上朝陽","is_owner":false}]
+      # is_owner は必ず false。true にすると全privateゴールが見える。
+      - key: AXIS_MEMBER_TOKENS
+        sync: false
