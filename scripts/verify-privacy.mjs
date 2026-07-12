@@ -79,12 +79,32 @@ if (probe) {
 const unknown = await call("get_goal_detail", { goal_id: "00000000-0000-0000-0000-000000000000" });
 check("存在しない goal_id で存在有無を漏らさない", unknown.includes("閲覧できません"));
 
-// 他人のタスクを user_id 指定で覗けないこと（自分のリストに強制される）
-const someoneElse = process.env.TEST_OTHER_USER_ID;
-if (someoneElse) {
-  const mine = rows(await call("get_today_tasks", {}));
-  const spoof = rows(await call("get_today_tasks", { user_id: someoneElse }));
-  check("get_today_tasks: 他人の user_id を指定しても自分のリストになる", JSON.stringify(mine) === JSON.stringify(spoof));
+// --- 日次タスクの可視範囲 ---
+// TEST_HIDDEN_USER_ID = AXIS_TASK_PRIVATE_USER_IDS に入れた人（弘中さん）。
+// このメンバーのタスクは、can_view_team_tasks を持つ相手からも見えてはならない。
+const hiddenUser = process.env.TEST_HIDDEN_USER_ID;
+if (hiddenUser) {
+  const direct = await call("get_today_tasks", { user_id: hiddenUser });
+  check(
+    "get_today_tasks: 非公開メンバー(弘中さん)のタスクを user_id 指定で覗けない",
+    direct.includes("非公開") || rows(direct).length === 0,
+    direct.slice(0, 40).replace(/\n/g, " ")
+  );
+
+  const teamRaw = await call("get_team_tasks", {});
+  let team = null;
+  try { team = JSON.parse(teamRaw); } catch { /* 権限が無ければ文言が返る */ }
+  if (team?.members) {
+    const ids = team.members.map((m) => m.user_id);
+    check("get_team_tasks: 他メンバーのタスクが見える", ids.length > 0, `${ids.length}人ぶん`);
+    check("get_team_tasks: 非公開メンバー(弘中さん)が結果に含まれない", !ids.includes(hiddenUser));
+    check("get_team_tasks: 除外した人数が申告されている", typeof team.hidden_members === "number", `hidden_members=${team.hidden_members}`);
+    const totalTasks = team.members.reduce((a, m) => a + m.tasks.length, 0);
+    console.log(`   期間 ${team.period.from} 〜 ${team.period.to} / タスク計 ${totalTasks}件`);
+    for (const m of team.members) console.log(`     ${m.name}: ${m.tasks.length}件`);
+  } else {
+    console.log(`… get_team_tasks は権限外（${teamRaw.slice(0, 40)}）— can_view_team_tasks が false の想定ならOK`);
+  }
 }
 
 await client.close();

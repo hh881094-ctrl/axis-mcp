@@ -30,24 +30,54 @@ const supabase: SupabaseClient = createClient(supabaseUrl, supabaseKey);
 const DEFAULT_TEAM_ID = process.env.AXIS_DEFAULT_TEAM_ID || undefined;
 const DEFAULT_USER_ID = process.env.AXIS_DEFAULT_USER_ID || undefined;
 
-/** 接続主体（誰として / どのチーム / ownerか）。 */
-type Ctx = { userId?: string; teamId?: string; isOwner?: boolean; name?: string };
+/** 接続主体（誰として / どのチーム / ownerか / 他メンバーのタスクを見てよいか）。 */
+type Ctx = { userId?: string; teamId?: string; isOwner?: boolean; name?: string; canViewTeamTasks?: boolean };
+
+/**
+ * 日次タスクを非owner に見せないメンバー（user_id）。
+ * env AXIS_TASK_PRIVATE_USER_IDS にカンマ区切り or JSON配列で渡す。
+ *
+ * 用途: 「メンバー同士はタスクを見せ合ってよいが、弘中さんのタスクだけは見せない」。
+ * ここに入れた人のタスクは can_view_team_tasks を持つメンバーからも隠れる（owner本人は見える）。
+ */
+function loadTaskPrivateUsers(): Set<string> {
+  const raw = (process.env.AXIS_TASK_PRIVATE_USER_IDS || "").trim();
+  if (!raw) return new Set();
+  let ids: string[] = [];
+  if (raw.startsWith("[")) {
+    try { ids = JSON.parse(raw) as string[]; } catch { console.error("AXIS_TASK_PRIVATE_USER_IDS の JSON が不正です"); }
+  } else {
+    ids = raw.split(",");
+  }
+  return new Set(ids.map((s) => String(s).trim()).filter(Boolean));
+}
+const TASK_PRIVATE_USERS = loadTaskPrivateUsers();
 
 /**
  * メンバー別トークン。各メンバーが自分の Claude を繋ぐための個人トークン → 本人。
  * env AXIS_MEMBER_TOKENS に JSON 配列で渡す:
- *   [{"token":"axis_xxx","user_id":"<uuid>","name":"山本将来","is_owner":false}]
+ *   [{"token":"axis_xxx","user_id":"<uuid>","name":"山本将来","is_owner":false,"can_view_team_tasks":true}]
  * team_id 省略時は AXIS_DEFAULT_TEAM_ID。
+ *
+ * can_view_team_tasks: 他メンバーの日次タスクを見てよいか（既定 false = 自分のぶんだけ）。
+ *   true にしても AXIS_TASK_PRIVATE_USER_IDS に入っている人のタスクは見えない。
+ *   ゴールの is_private は別軸で常に効く（この権限では private ゴールは見えない）。
  */
 function loadMemberTokens(): Map<string, Ctx> {
   const map = new Map<string, Ctx>();
   const raw = process.env.AXIS_MEMBER_TOKENS;
   if (!raw) return map;
   try {
-    const arr = JSON.parse(raw) as Array<{ token: string; user_id: string; team_id?: string; name?: string; is_owner?: boolean }>;
+    const arr = JSON.parse(raw) as Array<{ token: string; user_id: string; team_id?: string; name?: string; is_owner?: boolean; can_view_team_tasks?: boolean }>;
     for (const e of arr) {
       if (!e.token || !e.user_id) continue;
-      map.set(e.token, { userId: e.user_id, teamId: e.team_id ?? DEFAULT_TEAM_ID, isOwner: !!e.is_owner, name: e.name });
+      map.set(e.token, {
+        userId: e.user_id,
+        teamId: e.team_id ?? DEFAULT_TEAM_ID,
+        isOwner: !!e.is_owner,
+        name: e.name,
+        canViewTeamTasks: !!e.can_view_team_tasks,
+      });
     }
   } catch (err) {
     console.error("AXIS_MEMBER_TOKENS の JSON が不正です:", (err as Error).message);
@@ -61,6 +91,20 @@ const json = (v: unknown) => text(JSON.stringify(v, null, 2));
 
 function todayJST(): string {
   return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Tokyo" });
+}
+
+/** 今週（月曜〜日曜, JST）の [開始日, 終了日] を YYYY-MM-DD で返す。 */
+function thisWeekJST(): [string, string] {
+  const today = todayJST();                       // JSTの今日
+  const d = new Date(`${today}T00:00:00Z`);       // 日付だけをUTC正午前として扱い、曜日計算のズレを避ける
+  const dow = d.getUTCDay();                      // 0=日, 1=月, ...
+  const backToMonday = dow === 0 ? 6 : dow - 1;   // 日曜は前の月曜まで6日戻る
+  const monday = new Date(d);
+  monday.setUTCDate(d.getUTCDate() - backToMonday);
+  const sunday = new Date(monday);
+  sunday.setUTCDate(monday.getUTCDate() + 6);
+  const fmt = (x: Date) => x.toISOString().slice(0, 10);
+  return [fmt(monday), fmt(sunday)];
 }
 
 /** チーム内で「アーカイブされた祖先を持つゴール」のID集合（Axis本体の getArchivedSubtreeGoalIds と同等）。 */
@@ -92,8 +136,26 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
   const isOwner = ctx.isOwner ?? true;
 
   const teamOf = (param?: string) => param ?? ctxTeam;
-  // 非owner は自分以外の user_id を指定できない（他人のタスクを覗けない）。
-  const userOf = (param?: string) => (isOwner ? (param ?? ctxUser) : ctxUser);
+
+  // 他メンバーの日次タスクを見てよいか。owner か、can_view_team_tasks を持つメンバーのみ。
+  const canViewTeamTasks = isOwner || !!ctx.canViewTeamTasks;
+
+  // タスクを見せないメンバー（弘中さん等）。owner本人にはこの制限をかけない。
+  const taskHidden = (uid: string) => !isOwner && TASK_PRIVATE_USERS.has(uid);
+
+  /**
+   * 日次タスクで参照してよい user_id を決める。
+   * - 権限が無ければ常に自分に強制（他人を覗けない）
+   * - 権限があっても、非公開設定のメンバー（弘中さん）は指定できない
+   * 返り値が null なら「見せられない」。
+   */
+  const taskUserOf = (param?: string): string | null | undefined => {
+    if (!param) return ctxUser;                    // 未指定 → 自分
+    if (param === ctxUser) return ctxUser;         // 自分自身は常にOK
+    if (!canViewTeamTasks) return ctxUser;         // 権限なし → 自分に強制（従来どおり）
+    if (taskHidden(param)) return null;            // 非公開メンバー → 拒否
+    return param;
+  };
 
   // Axis のプライバシー規則を MCP 側でも再現:
   // 非owner は他人の private ゴールを見られない（is_private が false/null、または自分作成のもののみ）。
@@ -248,11 +310,12 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
   // ── 今日のタスク / 進捗 ──────────────────────────────────
   server.tool(
     "get_today_tasks",
-    "今日のToDoリストを取得する。非ownerは自分のぶんのみ。",
+    "今日のToDoリストを取得する。user_id 省略時は自分のぶん。チーム全員をまとめて見るなら get_team_tasks を使う。",
     { user_id: z.string().optional(), team_id: z.string().optional(), date: z.string().optional() },
     async ({ user_id, team_id, date }) => {
       const tid = teamOf(team_id);
-      const uid = userOf(user_id);
+      const uid = taskUserOf(user_id);
+      if (uid === null) return text("このメンバーのタスクは非公開です");
       if (!tid || !uid) return text("team_id と user_id が必要です（whoami で確認）");
       const { data, error } = await supabase
         .from("daily_tasks")
@@ -260,6 +323,59 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
         .eq("team_id", tid).eq("user_id", uid).eq("task_date", date || todayJST()).order("sort_order");
       if (error) return text(`Error: ${error.message}`);
       return json(data);
+    }
+  );
+
+  server.tool(
+    "get_team_tasks",
+    "チームメンバーの日次タスクを期間指定でまとめて取得する（誰のタスクかが分かる形で返る）。" +
+      "date_from/date_to 省略時は今週（月〜日, JST）。「今週の全員のタスクを要約して」に使う。" +
+      "非公開に設定されたメンバーのタスクは含まれない。",
+    {
+      team_id: z.string().optional(),
+      date_from: z.string().optional(),
+      date_to: z.string().optional(),
+      only_incomplete: z.boolean().optional(),
+    },
+    async ({ team_id, date_from, date_to, only_incomplete }) => {
+      const tid = teamOf(team_id);
+      if (!tid) return text("team_id が必要です");
+      if (!canViewTeamTasks) return text("他メンバーのタスクを見る権限がありません（get_today_tasks で自分のぶんを取得してください）");
+
+      const [from, to] = date_from && date_to ? [date_from, date_to] : thisWeekJST();
+
+      const { data: members, error: mErr } = await supabase
+        .from("team_members").select("user_id, profiles(display_name)").eq("team_id", tid);
+      if (mErr) return text(`Error: ${mErr.message}`);
+
+      // 非公開メンバー（弘中さん等）はここで除外する。以降のクエリに user_id が渡らない。
+      const visible = (members ?? []).filter((m) => !taskHidden(m.user_id));
+      const nameOf = new Map(visible.map((m) => [m.user_id, (m.profiles as unknown as { display_name?: string } | null)?.display_name ?? "(不明)"]));
+      if (!visible.length) return text("表示できるメンバーがいません");
+
+      let q = supabase
+        .from("daily_tasks")
+        .select("id, user_id, title, is_completed, goal_id, task_date, sort_order")
+        .eq("team_id", tid)
+        .in("user_id", visible.map((m) => m.user_id))
+        .gte("task_date", from).lte("task_date", to)
+        .order("task_date").order("sort_order");
+      if (only_incomplete) q = q.eq("is_completed", false);
+      const { data, error } = await q;
+      if (error) return text(`Error: ${error.message}`);
+
+      // メンバーごとにまとめて返す（要約しやすい形）
+      const byUser = new Map<string, { user_id: string; name: string; tasks: unknown[] }>();
+      for (const m of visible) byUser.set(m.user_id, { user_id: m.user_id, name: nameOf.get(m.user_id)!, tasks: [] });
+      for (const t of data ?? []) {
+        byUser.get(t.user_id)?.tasks.push({ id: t.id, date: t.task_date, title: t.title, is_completed: t.is_completed, goal_id: t.goal_id });
+      }
+      const hiddenCount = (members ?? []).length - visible.length;
+      return json({
+        period: { from, to },
+        hidden_members: hiddenCount, // 非公開設定で除外された人数（中身は返さない）
+        members: [...byUser.values()],
+      });
     }
   );
 

@@ -35,6 +35,12 @@ services:
       - key: AXIS_DEFAULT_TEAM_ID
         value: db544bee-cae2-4310-9510-7c8193a3aa3e
 
+      # 日次タスクを他メンバーに見せない人。ここでは弘中さん。
+      # can_view_team_tasks を持つメンバーからも、この人のタスクだけは隠れる。
+      # （ゴールの is_private は別軸で常に効く）
+      - key: AXIS_TASK_PRIVATE_USER_IDS
+        value: 694aae26-94e3-4e3c-a6a3-461f17d0d388
+
       - key: AXIS_SUPABASE_URL
         value: https://trqpkkxugbqkvxsxmdfh.supabase.co
 
@@ -43,7 +49,11 @@ services:
         sync: false
 
       # メンバー個人トークン。ダッシュボードで JSON 配列を入力する。
-      # 例: [{"token":"axis_...","user_id":"<uuid>","name":"井上朝陽","is_owner":false}]
+      # 例:
+      #   [{"token":"axis_...","user_id":"<uuid>","name":"井上朝陽",
+      #     "is_owner":false,"can_view_team_tasks":true}]
       # is_owner は必ず false。true にすると全privateゴールが見える。
+      # can_view_team_tasks:true で他メンバーの日次タスクが見える
+      #   （AXIS_TASK_PRIVATE_USER_IDS の人は除く）。
       - key: AXIS_MEMBER_TOKENS
         sync: false
