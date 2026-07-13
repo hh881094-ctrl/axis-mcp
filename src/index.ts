@@ -128,7 +128,7 @@ async function archivedSubtreeIds(teamId: string): Promise<Set<string>> {
 }
 
 export function createAxisServer(ctx: Ctx = {}): McpServer {
-  const server = new McpServer({ name: "axis-mcp", version: "1.2.0" });
+  const server = new McpServer({ name: "axis-mcp", version: "1.3.0" });
 
   // 接続主体の実効値。stdio(ローカル/owner)は ctx 未指定 → owner 扱い・既定ID。
   const ctxTeam = ctx.teamId ?? DEFAULT_TEAM_ID;
@@ -393,8 +393,11 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
       if (!goals?.length) return text("KPIが設定されたアクティブゴールがありません");
       const hidden = await archivedSubtreeIds(tid);
       const visible = goals.filter((g) => !hidden.has(g.id));
-      const { data: kpis } = await supabase.from("goal_progress").select("id, goal_id, title, current_value, target_value, unit").in("goal_id", visible.map((g) => g.id));
+      // ⚠️ .in("goal_id", [500件]) は URL が巨大になり fetch failed で落ちる。
+      //    KPI は全体でも数十件なので、全部取ってメモリ側で絞る。
       const gm = new Map(visible.map((g) => [g.id, g]));
+      const { data: allKpis } = await supabase.from("goal_progress").select("id, goal_id, title, current_value, target_value, unit");
+      const kpis = (allKpis ?? []).filter((k) => gm.has(k.goal_id));
       const result = (kpis ?? []).filter((k) => gm.has(k.goal_id)).map((k) => ({ ...k, goal_title: gm.get(k.goal_id)?.title, progress_pct: k.target_value > 0 ? Math.round((k.current_value / k.target_value) * 100) : 0 }));
       return json(result);
     }
@@ -551,6 +554,205 @@ export function createAxisServer(ctx: Ctx = {}): McpServer {
         return text("コメントを追加しました");
       }
     );
+
+    // ── 破壊的操作（削除・アーカイブ）: owner 専用 ─────────────────
+    //
+    // なぜ必要か: 読み取り系しか無かったため、廃止が決まったルールが Axis に生き残り続けた。
+    //   例) 2026-07-12 に「不要」と決着した『ウォームアップ配信』の KPI とサブゴールが active
+    //       のまま残っていた（放置すれば8月の配信初日に2週間を失うところだった）。
+    //       6月のゴールが7月も active のままで集計が壊れる、という実害も出ていた。
+    //
+    // 🔴 goals.parent_id は ON DELETE CASCADE。ゴールを1件消すと、子孫ゴールと
+    //    それにぶら下がる KPI・コメント・日次タスク・成果物まで黙って全部消える。
+    //    そのため削除系は必ず2段階にする:
+    //      confirm 省略/false → 何も消さず「消えるもの」を返す（プレビュー）
+    //      confirm: true      → 実行し、消したレコードを返す
+    //    AI が一発で誤爆できないようにするのが目的。緩めないこと。
+    if (isOwner) {
+      /** goalId 自身と全子孫（CASCADE で一緒に消える範囲）。 */
+      const subtreeOf = async (goalId: string) => {
+        let q = supabase.from("goals").select("id, title, status, parent_id, due_date");
+        if (ctxTeam) q = q.eq("team_id", ctxTeam);
+        const { data } = await q;
+        const rows = (data ?? []) as { id: string; title: string; status: string; parent_id: string | null; due_date: string | null }[];
+        const childrenOf = new Map<string, typeof rows>();
+        for (const r of rows) {
+          if (!r.parent_id) continue;
+          const list = childrenOf.get(r.parent_id) ?? [];
+          list.push(r);
+          childrenOf.set(r.parent_id, list);
+        }
+        const self = rows.find((r) => r.id === goalId);
+        if (!self) return null;
+        const out: typeof rows = [];
+        const walk = (id: string) => {
+          for (const c of childrenOf.get(id) ?? []) { out.push(c); walk(c.id); }
+        };
+        walk(goalId);
+        return { self, descendants: out };
+      };
+
+      /** 削除で一緒に消える付随レコードの件数。 */
+      const collateral = async (goalIds: string[]) => {
+        // .in() は件数が多いと URL が巨大化して落ちるため 100件ずつ数える。
+        const countIn = async (table: string) => {
+          let total = 0;
+          for (let i = 0; i < goalIds.length; i += 100) {
+            const { count } = await supabase.from(table).select("id", { count: "exact", head: true }).in("goal_id", goalIds.slice(i, i + 100));
+            total += count ?? 0;
+          }
+          return total;
+        };
+        return {
+          kpis: await countIn("goal_progress"),
+          comments: await countIn("comments"),
+          daily_tasks: await countIn("daily_tasks"),
+          deliverables: await countIn("deliverables"),
+        };
+      };
+
+      server.tool(
+        "list_kpis",
+        "ゴールのKPI(goal_progress)を id 付きで一覧する。delete_kpi / update_kpi_value に渡す kpi_id を取るために使う。" +
+          "goal_id 省略時はアクティブゴールのKPIを全部返す。",
+        { goal_id: z.string().optional(), team_id: z.string().optional() },
+        async ({ goal_id, team_id }) => {
+          if (goal_id) {
+            const goal = await readableGoal(goal_id);
+            if (!goal) return text("このゴールは閲覧できません（非公開、または別チームのゴールです）");
+            const { data, error } = await supabase
+              .from("goal_progress")
+              .select("id, goal_id, title, current_value, target_value, unit")
+              .eq("goal_id", goal_id);
+            if (error) return text(`Error: ${error.message}`);
+            return json({ goal_id, goal_title: goal.title, kpis: data ?? [] });
+          }
+          const tid = teamOf(team_id);
+          if (!tid) return text("team_id が必要です");
+          const { data: goals } = await supabase.from("goals").select("id, title").eq("team_id", tid).eq("status", "active");
+          if (!goals?.length) return text("アクティブゴールがありません");
+          // ⚠️ .in("goal_id", [500件]) は URL が巨大になり fetch failed で落ちるので使わない。
+          const gm = new Map(goals.map((g) => [g.id, g.title]));
+          const { data: allKpis, error } = await supabase
+            .from("goal_progress")
+            .select("id, goal_id, title, current_value, target_value, unit");
+          if (error) return text(`Error: ${error.message}`);
+          return json(
+            (allKpis ?? [])
+              .filter((k) => gm.has(k.goal_id))
+              .map((k) => ({ ...k, goal_title: gm.get(k.goal_id) ?? null }))
+          );
+        }
+      );
+
+      server.tool(
+        "delete_kpi",
+        "（owner専用）KPI(goal_progress)を1件削除する。confirm を省略すると『何が消えるか』を返すだけで削除しない。" +
+          "実際に消すには confirm: true。kpi_id は list_kpis で取る。",
+        { kpi_id: z.string(), confirm: z.boolean().optional() },
+        async ({ kpi_id, confirm }) => {
+          const { data: kpi } = await supabase
+            .from("goal_progress")
+            .select("id, goal_id, title, current_value, target_value, unit")
+            .eq("id", kpi_id)
+            .maybeSingle();
+          // KPI 単体では権限が判定できないので、親ゴール経由でゲートを通す
+          if (!kpi || !(await readableGoal(kpi.goal_id))) return text("このKPIは操作できません（非公開、または別チームのゴールです）");
+
+          if (!confirm)
+            return json({
+              action: "delete_kpi",
+              confirmed: false,
+              will_delete: kpi,
+              note: "まだ削除していません。この内容でよければ confirm: true で再実行してください。",
+            });
+
+          const { error } = await supabase.from("goal_progress").delete().eq("id", kpi_id);
+          if (error) return text(`Error: ${error.message}`);
+          return json({ action: "delete_kpi", confirmed: true, deleted: kpi });
+        }
+      );
+
+      server.tool(
+        "delete_subgoal",
+        "（owner専用）サブゴールを削除する。🔴 子孫ゴールと、それにぶら下がるKPI・コメント・日次タスク・成果物も CASCADE で一緒に消える。" +
+          "confirm を省略すると『何が消えるか』を返すだけで削除しない。実際に消すには confirm: true。" +
+          "トップレベル（親なし）のゴールは事故が大きすぎるので削除できない → archive_goal を使う。",
+        { goal_id: z.string(), confirm: z.boolean().optional() },
+        async ({ goal_id, confirm }) => {
+          const goal = await readableGoal(goal_id);
+          if (!goal) return text("このゴールは操作できません（非公開、または別チームのゴールです）");
+          if (!goal.parent_id)
+            return text(
+              "これはトップレベルのゴールです。配下すべてを巻き込んで消えるため delete_subgoal では削除できません。" +
+                "残したまま隠したいなら archive_goal を使ってください。"
+            );
+
+          const tree = await subtreeOf(goal_id);
+          if (!tree) return text("このゴールは見つかりません");
+          const allIds = [goal_id, ...tree.descendants.map((d) => d.id)];
+          const also = await collateral(allIds);
+
+          if (!confirm)
+            return json({
+              action: "delete_subgoal",
+              confirmed: false,
+              will_delete_goal: { id: goal.id, title: goal.title, status: goal.status, due_date: goal.due_date },
+              will_also_delete_descendant_goals: tree.descendants.map((d) => ({ id: d.id, title: d.title, status: d.status })),
+              will_also_delete_records: also,
+              note: "まだ削除していません。上記は CASCADE で一緒に消えるものを含みます。confirm: true で再実行してください。",
+            });
+
+          const { error } = await supabase.from("goals").delete().eq("id", goal_id);
+          if (error) return text(`Error: ${error.message}`);
+          return json({
+            action: "delete_subgoal",
+            confirmed: true,
+            deleted_goal: { id: goal.id, title: goal.title },
+            deleted_descendant_goals: tree.descendants.map((d) => ({ id: d.id, title: d.title })),
+            deleted_records: also,
+          });
+        }
+      );
+
+      server.tool(
+        "archive_goal",
+        "（owner専用）ゴールをアーカイブ(status='archived')する。削除と違いデータは残り、元に戻せる。" +
+          "『6月のゴールが7月も active で集計が壊れる』の片付けはこれを使う。" +
+          "アーカイブすると配下のサブゴールも一覧から自動的に隠れる（データは消えない）。" +
+          "confirm を省略すると『何がアーカイブされるか』を返すだけで実行しない。",
+        { goal_id: z.string(), confirm: z.boolean().optional() },
+        async ({ goal_id, confirm }) => {
+          const goal = await readableGoal(goal_id);
+          if (!goal) return text("このゴールは操作できません（非公開、または別チームのゴールです）");
+          if (goal.status === "archived") return text(`ゴール「${goal.title}」は既にアーカイブ済みです`);
+
+          const tree = await subtreeOf(goal_id);
+          const descendants = tree?.descendants ?? [];
+
+          if (!confirm)
+            return json({
+              action: "archive_goal",
+              confirmed: false,
+              will_archive: { id: goal.id, title: goal.title, status: goal.status, due_date: goal.due_date },
+              will_be_hidden_with_it: descendants.map((d) => ({ id: d.id, title: d.title, status: d.status })),
+              note: "まだ実行していません。confirm: true で再実行してください（データは消えず、元に戻せます）。",
+            });
+
+          const { error } = await supabase
+            .from("goals")
+            .update({ status: "archived", updated_at: new Date().toISOString() })
+            .eq("id", goal_id);
+          if (error) return text(`Error: ${error.message}`);
+          return json({
+            action: "archive_goal",
+            confirmed: true,
+            archived: { id: goal.id, title: goal.title, previous_status: goal.status },
+            hidden_with_it: descendants.length,
+          });
+        }
+      );
+    }
   }
 
   return server;
